@@ -1,0 +1,363 @@
+import { ProjectType, EnvVariables, TemplateFile } from '../types.js';
+import { injectEnvVariables } from './env.js';
+import { getPlainBunDockerfile, getEnvBunDockerfile, getPrismaBunDockerfile } from '../templates/dockerfiles/index.js';
+import { getPlainBunCompose, getEnvBunCompose, getPrismaBunCompose } from '../templates/compose/index.js';
+import { 
+  getPlainBunWorkflow, 
+  getEnvBunWorkflow, 
+  getPrismaBunWorkflow,
+  getPlainBunProdWorkflow,
+  getEnvBunProdWorkflow,
+  getPrismaBunProdWorkflow 
+} from '../templates/workflows/index.js';
+
+/**
+ * Get the appropriate Dockerfile template for the selected project type
+ */
+function getDockerfileTemplate(projectType: ProjectType): string {
+  switch (projectType) {
+    case ProjectType.PLAIN:
+      return getPlainBunDockerfile();
+    case ProjectType.ENV:
+      return getEnvBunDockerfile();
+    case ProjectType.PRISMA:
+      return getPrismaBunDockerfile();
+    default:
+      throw new Error(`Unknown project type: ${projectType}`);
+  }
+}
+
+/**
+ * Get the appropriate Docker Compose template for the selected project type
+ */
+function getComposeTemplate(projectType: ProjectType): string {
+  switch (projectType) {
+    case ProjectType.PLAIN:
+      return getPlainBunCompose();
+    case ProjectType.ENV:
+      return getEnvBunCompose();
+    case ProjectType.PRISMA:
+      return getPrismaBunCompose();
+    default:
+      throw new Error(`Unknown project type: ${projectType}`);
+  }
+}
+
+/**
+ * Get the appropriate GitHub workflow template for the selected project type
+ */
+function getWorkflowTemplate(projectType: ProjectType, setupProdBranch: boolean): string {
+  switch (projectType) {
+    case ProjectType.PLAIN:
+      return getPlainBunWorkflow(setupProdBranch);
+    case ProjectType.ENV:
+      return getEnvBunWorkflow(setupProdBranch);
+    case ProjectType.PRISMA:
+      return getPrismaBunWorkflow(setupProdBranch);
+    default:
+      throw new Error(`Unknown project type: ${projectType}`);
+  }
+}
+
+/**
+ * Get the appropriate production GitHub workflow template for the selected project type
+ */
+function getProdWorkflowTemplate(projectType: ProjectType): string {
+  switch (projectType) {
+    case ProjectType.PLAIN:
+      return getPlainBunProdWorkflow();
+    case ProjectType.ENV:
+      return getEnvBunProdWorkflow();
+    case ProjectType.PRISMA:
+      return getPrismaBunProdWorkflow();
+    default:
+      throw new Error(`Unknown project type: ${projectType}`);
+  }
+}
+
+/**
+ * Process a template and replace all instances of a hardcoded domain with a new domain
+ */
+function replaceDomain(template: string, oldDomain: string, newDomain: string): string {
+  return template.replace(new RegExp(oldDomain, 'g'), newDomain);
+}
+
+/**
+ * Process a template and replace all instances of a hardcoded port with a new port
+ */
+function replacePort(template: string, oldPort: string, newPort: string): string {
+  return template.replace(new RegExp(oldPort, 'g'), newPort);
+}
+
+/**
+ * Generate all required template files with environment variables injected
+ */
+export function generateTemplates(
+  setupProdBranch: boolean,
+  projectType: ProjectType, 
+  envVars: EnvVariables = {}, 
+  domainName?: string,
+  prodDomainName?: string,
+  prodPort?: string | number,
+  additionalEnvVars: string[] = []
+): TemplateFile[] {
+  const templates: TemplateFile[] = [];
+  
+  // Add domain to environment variables if provided
+  const variables = { ...envVars };
+  if (domainName) {
+    variables.DOMAIN = domainName;
+  }
+
+  // Add production domain to environment variables if provided
+  if (prodDomainName) {
+    variables.PROD_DOMAIN = prodDomainName;
+  }
+
+  // Add production port to environment variables if provided
+  if (prodPort) {
+    variables.PROD_PORT = prodPort.toString();
+  }
+  
+  // Get raw templates
+  let dockerfileTemplate = getDockerfileTemplate(projectType);
+  let composeTemplate = getComposeTemplate(projectType);
+  let workflowTemplate = getWorkflowTemplate(projectType, setupProdBranch);
+  
+  // Get production workflow template if needed
+  let prodWorkflowTemplate = "";
+  if (setupProdBranch) {
+    prodWorkflowTemplate = getProdWorkflowTemplate(projectType);
+  }
+  
+  // Filter out server-related variables
+  const systemVars = ['SERVER_HOST', 'SERVER_USER', 'SSH_PRIVATE_KEY','PAT'];
+  const appEnvVars = additionalEnvVars.filter(varName => !systemVars.includes(varName));
+  
+  // Add dynamic environment variables to templates
+  if (appEnvVars.length > 0 && (projectType === ProjectType.ENV || projectType === ProjectType.PRISMA)) {
+    // Add build-time ARG and ENV to Dockerfile
+    let buildEnvSection = '';
+    appEnvVars.forEach(varName => {
+      // Use DOLLAR_SIGN placeholder to prevent variable substitution
+      buildEnvSection += `ARG ${varName}\nENV ${varName}=DOLLAR_SIGN${varName}\n`;
+    });
+    
+    // Insert build-time variables before "Build the app"
+    dockerfileTemplate = dockerfileTemplate.replace(
+      '# Build the app',
+      `${buildEnvSection}\n# Build the app`
+    );
+    
+    // Add runtime ARG and ENV to Dockerfile
+    let runtimeEnvSection = '';
+    appEnvVars.forEach(varName => {
+      // Use DOLLAR_SIGN placeholder to prevent variable substitution
+      runtimeEnvSection += `ARG ${varName}\nENV ${varName}=DOLLAR_SIGN${varName}\n`;
+    });
+    
+    // Insert runtime variables before EXPOSE
+    dockerfileTemplate = dockerfileTemplate.replace(
+      'EXPOSE 3000',
+      `${runtimeEnvSection}\nEXPOSE 3000`
+    );
+    
+    // Add variables to docker-compose build args
+    let composeArgsSection = '';
+    appEnvVars.forEach(varName => {
+      // Use DOLLAR_SIGN placeholder in compose file
+      composeArgsSection += `        - ${varName}=DOLLAR_SIGN{${varName}}\n`;
+    });
+    
+    // Insert build args in compose file
+    composeTemplate = composeTemplate.replace(
+      /args:([^\n]*)\n/,
+      `args:\n${composeArgsSection}`
+    );
+    
+    // Add variables to docker-compose environment
+    let composeEnvSection = '';
+    appEnvVars.forEach(varName => {
+      // Use DOLLAR_SIGN placeholder in compose file
+      composeEnvSection += `      - ${varName}=DOLLAR_SIGN{${varName}}\n`;
+    });
+    
+    // Insert environment variables in compose file
+    composeTemplate = composeTemplate.replace(
+      /environment:([^\n]*)\n/,
+      `environment:\n${composeEnvSection}`
+    );
+    
+    // Add variables to workflow exports
+    let workflowExportSection = '';
+    appEnvVars.forEach(varName => {
+      // Use DOLLAR_SIGN placeholder in workflow file
+      workflowExportSection += `            export ${varName}="DOLLAR_SIGN{${varName}}"\n`;
+    });
+    
+    // Insert exports in workflow file
+    workflowTemplate = workflowTemplate.replace(
+      /# Export environment variables\n/,
+      `# Export environment variables\n${workflowExportSection}`
+    );
+    
+    // Add variables to workflow unset
+    let workflowUnsetSection = '';
+    appEnvVars.forEach(varName => {
+      workflowUnsetSection += `            unset ${varName}\n`;
+    });
+    
+    // Insert unset commands in workflow file
+    workflowTemplate = workflowTemplate.replace(
+      /# Clear environment variables\n/,
+      `# Clear environment variables\n${workflowUnsetSection}`
+    );
+    
+    // Add environment variables to GitHub workflow
+    let workflowEnvSection = '';
+    appEnvVars.forEach(varName => {
+      workflowEnvSection += `          ${varName}: DOLLAR_SIGN{{ secrets.${varName} }}\n`;
+    });
+    
+    // Insert env variables in workflow env section
+    workflowTemplate = workflowTemplate.replace(
+      /env:([^\n]*)\n/,
+      `env:\n${workflowEnvSection}`
+    );
+    
+    // Add environment variables to envs parameter
+    const envsParamRegex = /envs:([^,\n]+)(,|\n)/;
+    const match = workflowTemplate.match(envsParamRegex);
+    if (match) {
+      const currentEnvs = match[1];
+      const envsVarList = appEnvVars.join(',');
+      workflowTemplate = workflowTemplate.replace(
+        envsParamRegex,
+        `envs: ${currentEnvs},${envsVarList}$2`
+      );
+    }
+
+    // If we're setting up a production branch, apply the same environment variable changes to the production workflow
+    if (setupProdBranch && prodWorkflowTemplate) {
+      // Add exports to prod workflow
+      prodWorkflowTemplate = prodWorkflowTemplate.replace(
+        /# Export environment variables\n/,
+        `# Export environment variables\n${workflowExportSection}`
+      );
+      
+      // Add unset commands to prod workflow
+      prodWorkflowTemplate = prodWorkflowTemplate.replace(
+        /# Clear environment variables\n/,
+        `# Clear environment variables\n${workflowUnsetSection}`
+      );
+      
+      // Add env variables to prod workflow
+      prodWorkflowTemplate = prodWorkflowTemplate.replace(
+        /env:([^\n]*)\n/,
+        `env:\n${workflowEnvSection}`
+      );
+      
+      // Add envs parameter to prod workflow
+      const prodEnvsMatch = prodWorkflowTemplate.match(envsParamRegex);
+      if (prodEnvsMatch) {
+        const currentProdEnvs = prodEnvsMatch[1];
+        const envsVarList = appEnvVars.join(',');
+        prodWorkflowTemplate = prodWorkflowTemplate.replace(
+          envsParamRegex,
+          `envs: ${currentProdEnvs},${envsVarList}$2`
+        );
+      }
+    }
+  }
+  
+  // Update domain in compose file if provided
+  if (domainName) {
+    composeTemplate = composeTemplate.replace(
+      /Host\(`[^`]*`\)/g,
+      `Host(\`${domainName}\`)`
+    );
+  }
+  
+  // Replace all instances of the hardcoded domain in workflow templates with the user's domain
+  const hardcodedDomain = "prod.domain.com";
+  if (setupProdBranch && prodDomainName) {
+    // Replace in both workflow templates
+    workflowTemplate = replaceDomain(workflowTemplate, hardcodedDomain, prodDomainName);
+    prodWorkflowTemplate = replaceDomain(prodWorkflowTemplate, hardcodedDomain, prodDomainName);
+  }
+  
+  // Replace all instances of the hardcoded port in workflow templates with the user's port
+  // Default port for production is 3001
+  const defaultProdPort = "3001";
+  if (setupProdBranch && prodPort) {
+    // We need to replace in the docker-compose port mapping pattern: 3001:3000
+    const oldPortPattern = `${defaultProdPort}:3000`;
+    const newPortPattern = `${prodPort}:3000`;
+    
+    // Replace in both workflow templates
+    workflowTemplate = replacePort(workflowTemplate, oldPortPattern, newPortPattern);
+    prodWorkflowTemplate = replacePort(prodWorkflowTemplate, oldPortPattern, newPortPattern);
+    
+    // Also need to replace in the sed command that updates the port mapping
+    const oldSedPortCmd = `sed -i 's/3000:3000/${defaultProdPort}:3000/g'`;
+    const newSedPortCmd = `sed -i 's/3000:3000/${prodPort}:3000/g'`;
+    
+    workflowTemplate = workflowTemplate.replace(oldSedPortCmd, newSedPortCmd);
+    prodWorkflowTemplate = prodWorkflowTemplate.replace(oldSedPortCmd, newSedPortCmd);
+    
+    // Update message in PR body
+    workflowTemplate = workflowTemplate.replace(
+      `- Updated port mapping from 3000:3000 to ${defaultProdPort}:3000`,
+      `- Updated port mapping from 3000:3000 to ${prodPort}:3000`
+    );
+    prodWorkflowTemplate = prodWorkflowTemplate.replace(
+      `- Updated port mapping from 3000:3000 to ${defaultProdPort}:3000`,
+      `- Updated port mapping from 3000:3000 to ${prodPort}:3000`
+    );
+  }
+
+  // Inject environment variables
+  const dockerfileContent = injectEnvVariables(dockerfileTemplate, variables);
+  const composeContent = injectEnvVariables(composeTemplate, variables);
+  const workflowContent = injectEnvVariables(workflowTemplate, variables);
+  
+  // Inject environment variables into prod workflow if needed
+  let prodWorkflowContent = "";
+  if (setupProdBranch && prodWorkflowTemplate) {
+    prodWorkflowContent = injectEnvVariables(prodWorkflowTemplate, variables);
+  }
+  
+  // Replace DOLLAR_SIGN placeholder with $ in final output
+  const replaceVariablePlaceholder = (content: string): string => {
+    return content
+      .replace(/DOLLAR_SIGN/g, '$')
+      .replace(/DOLLAR_SIGN{/g, '${')
+      .replace(/DOLLAR_SIGN{{/g, '${{');
+  };
+  
+  // Add to result with placeholder replacement
+  templates.push({
+    fileName: 'Dockerfile',
+    content: replaceVariablePlaceholder(dockerfileContent),
+  });
+  
+  templates.push({
+    fileName: 'docker-compose.yml',
+    content: replaceVariablePlaceholder(composeContent),
+  });
+  
+  templates.push({
+    fileName: '.github/workflows/deploy.yml',
+    content: replaceVariablePlaceholder(workflowContent),
+  });
+  
+  // Add the production workflow file if needed
+  if (setupProdBranch && prodWorkflowContent) {
+    templates.push({
+      fileName: '.github/workflows/deploy-prod.yml',
+      content: replaceVariablePlaceholder(prodWorkflowContent),
+    });
+  }
+  
+  return templates;
+}
